@@ -1,171 +1,129 @@
-# Performance Engineering: Accelerating Monte Carlo Pi Step-by-Step
+# Accelerating Monte Carlo $\pi$ Step-by-Step
 
-A Monte Carlo π approximation in C++ that I keep making faster, one deliberate step
-at a time — and write down the reasoning for. I'm teaching myself performance
-engineering, so instead of just dumping the final code, I kept a log of what I
-measured, what I guessed wrong, and what the profiler actually showed. If you're
-starting out too, you can follow along and learn with me.
+[![C++17](https://img.shields.io/badge/Language-C%2B%2B17-blue.svg)](https://en.cppreference.com/w/cpp/17)
+[![Platform](https://img.shields.io/badge/Architecture-ARM64%20NEON%20%7C%20Apple%20Silicon-orange.svg)](https://developer.arm.com/architectures/instruction-sets/simd-isas/neon)
+[![Build](https://img.shields.io/badge/Build-CMake%20Release-green.svg)](https://cmake.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-This project was inspired by a lecture from Mike Croucher (MathWorks) at
-EUMASTER4HPC in Luxembourg, 2026.
+Inspired by Mike Croucher’s lecture at **EUMASTER4HPC (Luxembourg)**, this repository documents a deliberate, empirical
+journey through low-level performance engineering. Rather than presenting only final code, every step documents: **the
+hypothesis $\to$ the profiler trace $\to$ the assembly reality $\to$ the benchmark delta**.
 
-## What is performance engineering
+---
 
-That lecture was my first real contact with performance engineering. I watched the
-speaker take a π computation that ran for something like 27 days and bring it down
-to a few minutes. A big part of that gap came from how parallel the problem is — but
-the jump is what stuck with me. I found it fascinating, and maybe
-you will too. Think about how many programs out there could be made faster: it's
-good for energy use and the environment, it makes real projects actually usable,
-and honestly it's just a puzzling, addictive kind of fun.
+## 📊 Benchmark Results at a Glance
 
-So, let's talk about the project.
+Tested on an **Apple M1 (MacBook Air, 8-core CPU)** with **Apple Clang (Release, `-O3`)** across $10^{9}$ (1 billion) samples. Figures are **nanoseconds per sample**; *spread* is (max − min) across the 10 timed runs.
 
-## Why This Project Exists
+| Version | Change | Min | Median | Spread | Speedup | Approx π | \|error\| |
+|:-------:|:-------|-----:|-------:|-------:|:-------:|:--------:|:--------:|
+| **v0** | libc `rand()` | 23.391 | 24.042 | 2.861 | **1.00×** | 3.141610 | 1.7 × 10⁻⁵ |
+| **v1** | Inlinable PCG32 (header) | 3.402 | 3.467 | 0.479 | **6.89×** | 3.141617 | 2.4 × 10⁻⁵ |
+| **v2** | Branchless hit test | 3.393 | 3.419 | 0.306 | **6.91×** | 3.141617 | 2.4 × 10⁻⁵ |
+| **v3** | SIMD NEON · 4-lane LCG | **0.505** | **0.505** | **0.001** | **46.4×** | 3.141582 | 1.1 × 10⁻⁵ |
 
-Estimating $\pi$ via Monte Carlo is mathematically simple: generate random points $(x, y)$ in a
-unit square and count how many land inside the inscribed quarter circle.
 
-Because the algorithm requires almost no complex domain logic, it removes code noise and isolates hardware execution.
 
-This repository walks through the fundamentals of performance engineering step-by-step:
+![Figure 1: Monte Carlo pi cost per sample across optimization stages](docs/images/benchmark_scientific.svg)
+**Figure 1 — cost per sample by optimization stage (log scale, lower is better).**
 
-1) Establishing a baseline: Measuring unoptimized, single-threaded execution and
-   identifying where CPU time is actually spent.
-2) Hardware-aware improvements: Moving from scalar computation to SIMD
-   vectorization, improving branch predictability, and choosing efficient Pseudo-Random Number Generators (PRNGs).
-3) Parallel
-   execution: Scaling across CPU cores while managing thread synchronization and cache coherence (avoiding false
-   sharing).
-4) Empirical validation: Using profilers to verify speedup using hardware counters (IPC, cache misses, branch misses).
+> **⚖️ Note on the v3 generator.** v0 → v2 hold the PRNG fixed (PCG32) and change one variable at a time. **v3 deliberately changes three at once** — 4-wide SIMD, `float32` instead of `double`, and a cheaper 4-lane LCG in place of PCG32 — so its gain over v2 is *not* attributable to NEON alone. Vectorizing PCG32 would require cross-lane shifts and its permutation step; to isolate raw arithmetic throughput, v3 benchmarks a vectorized 32-bit LCG, which is both computationally cheaper and statistically weaker (LCGs have known low-bit and lattice / spectral defects). For cryptographic or high-dimensional Monte Carlo where spectral quality matters, a 4-lane xoshiro128+ or a vectorized PCG should be substituted.
 
-Every step includes the rationale, code changes, and performance deltas so you can reproduce and
-observe the hardware effects on your own machine.
+### ⏱️ Supporting figures
 
-## Who this is for
 
-Basically, the person I was when I started. So:
 
-- You can read some C++ and run a compiler, but you've never sat down and
-  deliberately *optimized* anything.
-- You've heard "profile before you optimize" a hundred times and want to see what
-  that actually looks like when someone does it.
-- You'd rather learn from a tiny example where you can see cause and effect than from
-  a giant codebase where the lesson is buried.
+![1-Billion Sample Execution Race](docs/images/speed_race.svg)
 
-You don't need to know SIMD, PRNGs, or how a profiler works. Those are the things
-you'll pick up along the way — I didn't know them either.
+![v3 benchmark output in CLion](docs/images/V3_benchmarks.png)
 
-## How to follow along
+![v0 profile in Instruments](docs/images/V0_benchmarks.png)
 
-Go through it in this order. Each doc is short, and each one leans on the last.
 
-1. **[`docs/Approach.md`](docs/images/Approach.md)** —:the measure-first method the whole
-   project runs on. This is the mindset, and if you take away one file, take this one.
-2. **[`docs/Versions.md`](docs/Versions.md)** : the engineering log. Every version changes, and I wrote down a
-   prediction
-   *before* measuring. Try to guess each outcome before you read mine.
-3. **Build it and run it yourself** (see below). Watch the table print, and get a feel for the baseline before you
-   change a single line.
+---
 
-And really, don't just read my answers. Before each
-version, guess the speedup, then check. Then run the whole thing on your machine
-your numbers won't match mine, though the improvements will be there. Thus try it and figure out why you had different
-results (different CPU, compiler, noise) it could be a fun challenge on its own.
+## 🗺️ Architectural Roadmap
 
-## The versions
+This project explores the modern compute hierarchy layer-by-layer:
 
-Each step isolates one idea, so whatever changes in the numbers, you know what caused
-it. The full reasoning and the profiler screenshots live in
-[`docs/Versions.md`](docs/Versions.md).
+```
+[v0 Baseline] ──► Libc dynamic symbol overhead, optimization barriers
+      │
+      ▼
+[v1 Inlining] ──► PCG32 state machine in header, register promotion
+      │
+      ▼
+[v2 Branchless] ──► Compiler analysis, CMOV / conditional selects
+      │
+      ▼
+[v3 SIMD NEON] ──► 4-wide vectorization, FMA, IEEE-754 mantissa scaling (46.4×)
+      │
+      ▼
+[v4 Multi-core]  ──► planned: cache-padded std::jthread / OpenMP fan-out
+      │              (target ≈ near-linear scaling across the 4 performance cores)
+      ▼
+[v5 Microarch]   ──► planned: manual loop unrolling & ILP (dual-issue NEON pipelines)
+```
+-------
 
-| Version | Change                                                | What you learn from it                                                                      |
-|---------|-------------------------------------------------------|---------------------------------------------------------------------------------------------|
-| **v0**  | Baseline using libc `rand()`                          | You can't improve anything until you have something correct and measured to compare against |
-| **v1**  | Swap `rand()` for a small inlinable PCG32 in a header | How a plain function call can freeze the optimizer, and what inlining sets free             |
-| **v2**  | Rewrite the `if` as branchless `count += (…)`         | That the compiler has often *already* done the "obvious" trick — so verify, don't assume    |
 
-## Build & run
+## 🛠️ Build & Reproduce
 
-You'll need **CMake ≥ 3.20** and a **C++17** compiler (I use Apple Clang; GCC or Clang
-on Linux are fine too).
+### Prerequisites
+
+* **CMake ≥ 3.20**
+* **C++17 Compiler** (Apple Clang on macOS, GCC/Clang on Linux with ARM64 NEON)
+
+### Compiling and Running
 
 ```bash
-git clone <your-clone-url>
-cd Pi-Montecarlo-optimisation
+# Configure Release build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+# Compile
 cmake --build build
+
+# Execute benchmark
 ./build/pi_bench
 ```
 
-`pi_bench` runs every version across a few sample sizes (1e6, 1e7, 1e8) and prints,
-for each size, the π estimate and the min / median / spread in ns/sample, plus the
-speedup over v0.
+> [!IMPORTANT]
+> **Always benchmark Release builds (`-DCMAKE_BUILD_TYPE=Release`)**. In Debug mode, inlining is disabled and SIMD
+> registers are continuously spilled to the stack, producing unrepresentative timings.
 
-> **Always benchmark the Release build.** A Debug build isn't optimized, so its
-> timings describe code the real compiler would never emit. It's the most common
-> beginner mistake, and I go into why in [`docs/Versions.md`](docs/Versions.md).
+---
 
-### Profiling it yourself
-
-Total time tells you *whether* you got faster; a profiler tells you *where* the time
-actually goes, which is what you need to know what to fix next. The exact tools and
-steps I used are in
-[`docs/Versions.md` → How to profile](docs/Versions.md#how-to-profile-on-a-mac):
-Xcode **Instruments** on macOS, or **`perf`** on Linux.
-
-## Results
-
-Apple M1 (MacBook Air, 8 GB), CLion Release build.
-
-> Monte Carlo error shrinks like 1/√n. n = 1B → error ≈ 1/√(10⁹) ≈ 0.00003 → ~4 digits
-
-
-| Version | Change             | ns/sample | vs v0 |
-|---------|--------------------|-----------|-------|
-| v0      | baseline, `rand()` | 14.74     | 1.00× |
-| v1      | PCG32 (inlinable)  | 2.15      | 6.77× |
-| v2      | branchless         | 2.15      | 6.78× |
-
-Timing = the minimum of 10 runs
-after warmup. Lower ns/sample is better.
-
-## Repository layout
+## 📂 Repository Layout
 
 ```
-src/
-  main.cpp       # runs every version across a few sample sizes, prints a table
-  versions.cpp   
-  versions.hpp   
-  bench.hpp      # timing harness (warmup, repeated runs, min / median / spread)
-docs/
-  Approach.md    # the measure-first method 
-  Versions.md    # the engineering log: what changed each version and why
-CMakeLists.txt
+├── CMakeLists.txt         # Warnings (-Wall -Wextra); -O3 comes from the Release build type
+├── src/
+│   ├── main.cpp           # Benchmark runner
+│   ├── versions.hpp       # Function interfaces & scalar PRNG definitions
+│   ├── versions.cpp       # Kernels (v0 through v3 SIMD)
+│   └── bench.hpp          # Statistical timing harness (warmups, min, median, spread)
+├── docs/
+│   ├── Approach.md        # The measure-first engineering methodology
+│   ├── Versions.md        # Detailed engineering log, predictions, & profiler traces
+│   ├── Theory.md          # PRNG mathematics, IEEE-754 bits, and vector pipelines
+│   └── images/            # Profiler screenshots & benchmark evidence
 ```
 
-## Honest limitations
+---
 
-Some limitations I want to acknowledge
+## 🔬 Experimental Rig & Known Constraints
 
-- **It's one laptop, not a controlled rig.**:  On a MacBook I can't pin the CPU
-  frequency or turn off turbo, so I do what I can, close other apps, run on wall
-  power, and report the minimum of repeated runs to get as close to the true cost
-  as possible. So treat the numbers as indicative, not publishable, and expect your
-  own machine to give different ones.
+* **Host Hardware**: Apple M1 (MacBook Air, 8 GB Unified Memory)
+* **Frequency Scaling**: macOS does not allow manual pinning of CPU clock frequencies or disabling Turbo Boost. To
+  ensure statistical integrity, the benchmark harness discards 2 warmup runs, conducts 10 repeated runs, and reports the
+  **minimum runtime** (the run least perturbed by background OS noise).
+* **Dispersion (and its limits here)**: the results table reports *spread* = (max − min) over the 10 runs, **not** a
+  standard deviation — the harness keeps only min / median / spread, so a true σ or IQR would require logging every run.
+  Even so, the tight spread on the optimized kernels (0.001 ns on v3 vs 2.861 ns on v0) shows the speedups are not the
+  artefact of a single lucky run.
 
-> I'm learning as I go. If you spot something wrong, that probably means you're
-> reading it properly, open an issue and I'll learn from it too.feel free to reach out and give some feedback it is
-> really
-> appreciataed, thank you all :)
+---
 
-## Tools
+## 📜 License
 
-- **Hardware:** MacBook Air, Apple M1, 8 GB RAM
-- **Profiler:** Xcode Instruments (Time Profiler), `perf` is Linux-only
-- **AI (Claude):** used as a sounding board to lay out options (like the PRNG
-  comparison table in the docs). The decisions and the code are mine.
-
-## License
-
-MIT — see [`LICENSE`](LICENSE). Use it, fork it, learn from it.
+MIT License — see [`LICENSE`](LICENSE). Feel free to fork, benchmark, and build on this!

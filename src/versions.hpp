@@ -1,9 +1,12 @@
 #pragma once
+#include <arm_neon.h>
 #include<cstdint>
 
 double mc_pi_v0(long n_samples);
 double mc_pi_v1(long n_samples);
 double mc_pi_v2(long n_samples);
+double mc_pi_v3(long n_samples); // NEON SIMD, Apple Silicon (ARM64) only
+
 
 
 

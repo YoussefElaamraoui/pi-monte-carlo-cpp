@@ -7,9 +7,13 @@ int main() {
         {"v0", mc_pi_v0},
         {"v1", mc_pi_v1},
         {"v2", mc_pi_v2},
+        {"v3", mc_pi_v3},
 
     };
 
-    run_table(versions, 3, sizes, 4);
+    // size of trick -> total bytes / bytes per version (versions are all equal in size) -> therefore it
+    // return just the number of elements. On c++ version >17 you can include "#include <iterator>"
+    // and just use size(versions)
+    run_table(versions, sizeof(versions) / sizeof(versions[0]), sizes, sizeof(sizes) / sizeof(sizes[0]));
     return 0;
 }

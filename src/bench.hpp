@@ -66,8 +66,8 @@ inline void run_table(const Version* versions, int n_versions,const long* sizes,
         const Stats base = time_it(versions[0].fn, n);
 
         std::printf("\n--- n = %ld ---\n", n);
-        std::printf("%-10s %12s %12s %10s %12s %9s\n",
-            "version", "approx", "min ns/smp", "time (s)", "spread ns", "speedup");
+        std::printf("%-10s %12s %12s %10s %12s %12s %9s\n",
+            "version", "approx", "min ns/smp", "time (s)", "med ns", "spread ns", "speedup");
 
         // Comparing the stats with baseline
         for (int vi = 0; vi < n_versions; ++vi) {
@@ -82,6 +82,7 @@ inline void run_table(const Version* versions, int n_versions,const long* sizes,
 
             std::printf("%-10s %12.6f %12.3f %10.3f %12.3f %12.4f %8.2fx\n",
                         versions[vi].name, approx, min_ns, min_time_s,med_ns, spread_ns, speedup);
+            std::fflush(stdout);
         }
 
 

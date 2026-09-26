@@ -77,3 +77,6 @@ Testing/
 
 # macOS
 .DS_Store
+
+# Assembly dumps
+*.s

@@ -43,20 +43,20 @@ Consequence: the interesting part has to run *long enough* to collect enough sam
 
 ### Finding the bottleneck:
 
-![v0 profile in Instruments](images/V0_benchmarks.png)
+![v0 profile in Instruments](images/v0_instruments_profile.png)
 
 rand and its machinery are clearly the bottleneck. Reading the profile carefully, mc_pi_v0 takes 1.29 s of the 1.63 s
 total (79%), and inside that the RNG cost is split across three rows:
 
 1) rand itself → 711 ms
-2) DYLD-STUB$$rand → 380 ms. The stub: because rand lives in a shared library, my code can't jump straight to it, it jumps
-into the library, and pays that indirection on every call( This ~380 ms is the
-total across all calls, not the cost of one) 
+2) DYLD-STUB$$rand → 380 ms. The stub: because rand lives in a shared library, my code can't jump straight to it, it
+   jumps
+   into the library, and pays that indirection on every call( This ~380 ms is the
+   total across all calls, not the cost of one)
 3) a second rand entry → 339 ms
 
-Together those three are ~1430 ms, about **88% of the total runtime**. Meanwhile mc_pi_v0  is only 201
+Together those three are ~1430 ms, about **88% of the total runtime**. Meanwhile mc_pi_v0 is only 201
 ms, so only ~12% of the runtime.
-
 
 ### Solution & result
 
@@ -188,10 +188,167 @@ Two ways to get there:
 
 **The catch:** SIMD wants four `(x, y)` values at once, but a PRNG's outputs are
 *sequential*, which means each state depends on the previous, so I can't get four independent
-values in one step from the current generator. To feed four lanes I'll need a PRNG
+values in one step from the current generator. To feed four lanes I need a PRNG
 variant that produces four streams in parallel.
 
+### Solution: 4-Lane LCG with Decoupled $X$ and $Y$ Streams
 
+To saturate a 128-bit NEON vector register (which holds $4 \times 32$-bit integers), we advance 4 independent
+pseudo-random streams in lockstep using a Linear Congruential Generator (LCG):
+
+$$\text{state}_{t+1} = (\text{state}_t \times M + C) \pmod{2^{32}}$$
+
+With Numerical Recipes constants ($M = 1664525, C = 1013904223$), the multiplication overflow natively
+computes $\pmod{2^{32}}$ for free in 32-bit registers.
+
+
+
+#### Key Architectural Components:
+
+1. **Decoupled Seeding (Avoiding 2D Correlation Collapse)**:
+   If $X$ and $Y$ share the same seed or stream, all points collapse onto the line $y = x$, and $\pi$ erroneously
+   converges to $4 / \sqrt{2} \approx 2.8284$.
+   We use `splitmix32(z)` with $z$ passed by reference to generate 8 consecutive, non-overlapping initial seeds: 4 for
+   `statex` and 4 for `statey`.
+
+2. **Pipelined Vector Generator (`next_float4`)**:
+   ```cpp
+   static inline float32x4_t next_float4(uint32x4_t &state, uint32x4_t M, uint32x4_t C, float32x4_t inv_scale) {
+       state = vmlaq_u32(C, state, M);                             // 1. Advance 4 states with fused multiply-add
+       uint32x4_t top24x = vshrq_n_u32(state, 8);                  // 2. Extract top 24 bits
+       float32x4_t f = vcvtq_f32_u32(top24x);                      // 3. Convert to 32-bit float
+       return vmulq_f32(f, inv_scale);                             // 4. Multiply by reciprocal (2^-24)
+   }
+   ```
+    * **Why shift 8 bits?** Single-precision IEEE-754 floats have 23 explicit mantissa bits + 1 implicit leading bit =
+      24 bits of precision. Keeping the top 24 bits prevents rounding noise.
+    * **Why reciprocal multiply?** Multiplication on ARM NEON is fully pipelined with a 1-cycle throughput.
+      Floating-point division takes 10–15 cycles.
+
+3. **Fused Multiply-Add (FMA) Geometry Check**:
+   ```cpp
+   float32x4_t r = vmulq_f32(x, x);
+   r = vmlaq_f32(r, y, y); // r = x*x + y*y in a single fused instruction
+   ```
+
+4. **Branchless Two's-Complement Accumulation**:
+   `vcleq_f32(r, 1.0f)` returns an all-ones bitmask (`0xFFFFFFFF` $\equiv -1$) for hits, and `0x0` for misses.
+   Subtracting this mask (`hits = vsubq_u32(hits, mask)`) computes $\text{hits} - (-1) = \text{hits} + 1$ without any
+   branch misprediction penalties.
+
+5. **Horizontal Vector Reduction**:
+   After the loop, `vaddvq_u32(hits)` performs a hardware horizontal reduction across the 4 lanes to yield the scalar
+   total hit count.
+
+---
+
+## v4 — Multi-core (OpenMP)
+
+v4 keeps the v3 SIMD kernel byte-for-byte and only spreads its iterations across cores with OpenMP, so any speedup is
+*pure parallelism* — nothing else changed. (v4 on one thread matches v3 to within noise, which is the proof of that.)
+
+**How it works.** `#pragma omp parallel` forks a team of threads from a reused pool (not new OS threads per call); each
+thread seeds its own RNG from `omp_get_thread_num()`, runs its slice of the loop, and `reduction(+:hits)` gives every
+thread a private counter that the runtime sums once at the end — accumulate locally, combine once, so there is no false
+sharing on the global count.
+
+**Prediction → result.** The M1 has **4 performance + 4 efficiency cores**. I hoped for ~8×; I measured ~4.7×. Instead of
+guessing why, I benchmarked each thread count to locate the gap:
+
+| Threads | speedup vs 1 thread | efficiency |
+|:-------:|:-------------------:|:----------:|
+| 2 | 1.98× | 99% |
+| 4 (P-cores) | 3.74× | 94% |
+| 8 (4P + 4E) | 4.70× | 59% |
+
+**The finding.** Scaling is near-linear up to the 4 *performance* cores (94% efficiency). The 4 *efficiency* cores then
+add real but **sub-linear** throughput — 8 threads gives 4.70×, not 8× — because an E-core is much slower than a P-core.
+The "missing" speedup isn't a bug in the code; it's the heterogeneous chip. (macOS also gives no way to pin threads to
+specific cores, so which thread lands on which core is the scheduler's call.)
+
+---
+
+## v5 — GPU (CUDA)
+
+v4 saturated the CPU, so v5 changes the *machine*: a GPU trades a handful of fast cores for **thousands of slow ones**.
+The same LCG kernel, rewritten in CUDA and run on a **Tesla T4** (Google Colab), reaches **180 Gsample/s** — about **12×
+the best CPU (v4)** and ~2,650× v0.
+
+### What makes it a GPU program (not just parallel)
+
+- **SIMT, not SIMD.** Threads run in lock-step groups of 32 (a *warp*): I write plain scalar code and the hardware runs
+  32 lanes at once. It's v3's SIMD idea, but the hardware does the vectorizing for me.
+- **Latency hiding by oversubscription.** Each thread's LCG is a slow dependent chain. The GPU hides that by keeping
+  thousands of threads resident and switching warps whenever one stalls — which is exactly why a GPU needs a *lot* of
+  work to be fast.
+- **Grid-stride loop.** A fixed grid (256 × 256 = 65,536 threads) walks the array in strides of `total_threads`, so one
+  launch covers any `N`.
+- **One `atomicAdd` per thread.** Each thread keeps a private `local` count and adds it to the global counter *once*, at
+  the end — the same "combine once" idea as v4's reduction, so atomic contention stays negligible.
+
+### What I chose to measure
+
+There are two honest numbers. **Kernel-only time** (`cudaEvent` around the launch) is pure compute — the fair match to
+the CPU `ns/sample`, which was also pure compute. **End-to-end time** would add `cudaMalloc` and the copy back (the
+"real world" number). For Monte Carlo π they're nearly identical — the only host↔device transfer is a single counter —
+so I report **kernel-only**. The first launch is slow because CUDA does one-time context setup, so I run a throwaway
+**warm-up** first, then time.
+
+### Results (Tesla T4, kernel time)
+
+| Samples | Kernel time | Throughput | Approx π |
+|--------:|------------:|-----------:|:--------:|
+| $10^6$ | 0.109 ms | 9 Gsample/s | 3.141536 |
+| $10^7$ | 0.121 ms | 83 Gsample/s | 3.141678 |
+| $10^8$ | 0.565 ms | 177 Gsample/s | 3.141682 |
+| $10^9$ | 5.549 ms | **180 Gsample/s** | 3.141667 |
+
+Notice the **warm-up curve**: at $10^6$ the GPU manages only ~9 Gsample/s — 65,536 threads over a fixed launch cost have
+too little work to amortize — and throughput climbs until it saturates near $10^8$–$10^9$. That is the defining trait of
+a **throughput device**: the CPU wins the small jobs (low latency), the GPU wins the big ones. The per-thread seed here
+is a single multiply (not `splitmix`), which is why the GPU's π error (~7×10⁻⁵) is a touch higher than the CPU's.
+
+
+### Empirical Results
+
+![v3 benchmark in CLion](images/v3_clion_output.png)
+
+| Version | Device | Approx π | ns/sample | Throughput | Speedup |
+|:-------:|:------:|:--------:|----------:|-----------:|:-------:|
+| v0 | M1 (1 core) | 3.141610 | 14.713 | 0.068 G/s | 1.00× |
+| v1 | M1 (1 core) | 3.141617 | 2.144 | 0.47 G/s | 6.8× |
+| v2 | M1 (1 core) | 3.141617 | 2.127 | 0.47 G/s | 6.9× |
+| v3 | M1 (1 core) | 3.141582 | 0.316 | 3.16 G/s | 46× |
+| **v4** | M1 (8 cores) | 3.141578 | **0.067** | **14.9 G/s** | **217×** |
+| **v5** | Tesla T4 GPU | 3.141667 | **0.0055** | **180 G/s** | **~2,650×** |
+
+*All at $N = 10^9$. **Throughput** = 1 / (ns per sample) — the samples-per-second the kernel sustains, and the most
+intuitive column: 68 million/s (v0) climbs to 180 billion/s (v5). ns/sample is min-of-10 for the CPU, single-run for the
+GPU. v4's per-thread-count scaling (1/2/4/8) is in the v4 section; v5 across sample sizes is in the v5 section. v5 is a
+different device (T4 GPU vs M1 laptop), so its speedup compares devices, not the same silicon.*
+
+### Microarchitectural Analysis: Cracking the Sub-Nanosecond Barrier
+
+* **Clock Cycle Budget**: On an Apple M1 Firestorm core running at $\approx 3.2\text{ GHz}$, 1
+  cycle $\approx 0.3125\text{ ns}$.
+  $$\text{Cycles per Sample} = \frac{0.316\text{ ns}}{0.3125\text{ ns}} \approx \mathbf{1.01\text{ cycles}}$$
+  Because each iteration processes 4 samples, one loop iteration executes
+  in $\approx \mathbf{4.05\text{ clock cycles}}$.
+* **Vector IPC (Instructions Per Cycle)**: The hot loop executes ~12 vector instructions (2 LCG steps, 2 bit-shifts, 2
+  conversions, 2 multiplications, 1 FMA, 1 comparison, 1 subtraction, loop overhead) in ~6.5 cycles, sustaining an
+  impressive Vector IPC of $\approx \mathbf{3.0}$.
+* **Zero Cache Interactions**: All 4 states, constants, and accumulator registers reside completely inside NEON
+  registers `q0–q31`. The spread across 10 runs at $N=10^9$ is just **$0.0013\text{ ns}$**, demonstrating zero cache
+  thrashing or pipeline stalls.
+
+### Engineering Trade-Offs
+
+* **LCG vs PCG32**: LCG is extremely cheap (a single fused multiply-add) and fits SIMD naturally. However, in
+  higher-dimensional Monte Carlo problems, LCG suffers from the Marsaglia defect (points falling on parallel
+  hyperplanes). For 2D $\pi$ with separate initial seeds, accuracy is preserved ($\epsilon \approx 10^{-5}$ at $10^9$),
+  but scientific simulations often prefer counter-based PRNGs (like Philox).
+* **Instruction Portability**: Intrinsics in `<arm_neon.h>` are specific to ARM64. Supporting x86 architectures requires
+  mapping to AVX2/AVX-512 (`_mm256_*`) or utilizing cross-platform SIMD wrappers like Google Highway.
 
 ---
 

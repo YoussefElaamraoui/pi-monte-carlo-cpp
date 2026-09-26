@@ -2,6 +2,7 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 
 struct Stats {
     double min_s;
@@ -57,7 +58,15 @@ struct Version {
     double (*fn)(long);
 };
 
-inline void run_table(const Version* versions, int n_versions,const long* sizes, int n_sizes) {
+inline void run_table(const Version* versions, int n_versions, const long* sizes, int n_sizes) {
+
+    // Legend — printed once so the columns are self-explanatory.
+    std::printf("\nColumns:\n");
+    std::printf("  approx  : the pi estimate (should sit near 3.14159)\n");
+    std::printf("  ns/smp  : nanoseconds to process ONE sample  (min of the timed runs; lower is better)\n");
+    std::printf("  Gsmp/s  : throughput, billions of samples per second  (= 1 / ns-per-sample; higher is better)\n");
+    std::printf("  speedup : throughput relative to v0 (the baseline)\n");
+    std::printf("  spread  : (max - min) ns/sample across the runs  (small spread = a stable measurement)\n");
 
     for (int si = 0; si < n_sizes; ++si) {
         const long n = sizes[si];
@@ -65,26 +74,20 @@ inline void run_table(const Version* versions, int n_versions,const long* sizes,
         // Time the baseline (versions[0]) first, to compute speedups.
         const Stats base = time_it(versions[0].fn, n);
 
-        std::printf("\n--- n = %ld ---\n", n);
-        std::printf("%-10s %12s %12s %10s %12s %12s %9s\n",
-            "version", "approx", "min ns/smp", "time (s)", "med ns", "spread ns", "speedup");
+        std::printf("\n--- n = %ld samples ---\n", n);
+        std::printf("%-8s %10s %11s %10s %9s %9s\n",
+                    "version", "approx", "ns/smp", "Gsmp/s", "speedup", "spread");
 
-        // Comparing the stats with baseline
         for (int vi = 0; vi < n_versions; ++vi) {
             const Stats s = time_it(versions[vi].fn, n);
-            const double min_time_s = s.min_s;   // the fastest run's wall-clock seconds
-            const double min_ns    = s.min_s    * 1e9 / n;
-            const double med_ns    = s.median_s * 1e9 / n;
-            const double spread_ns = s.spread_s * 1e9 / n;
+            const double min_ns    = s.min_s    * 1e9 / n;   // nanoseconds per sample (the fastest run)
+            const double gsamples  = 1.0 / min_ns;           // throughput in billions/sec (= 1 / ns-per-sample)
+            const double spread_ns = s.spread_s * 1e9 / n;   // run-to-run spread, same units
             const double speedup   = base.min_s / s.min_s;   // >1 means faster than v0
-            const double approx = s.approximation;
 
-
-            std::printf("%-10s %12.6f %12.3f %10.3f %12.3f %12.4f %8.2fx\n",
-                        versions[vi].name, approx, min_ns, min_time_s,med_ns, spread_ns, speedup);
+            std::printf("%-8s %10.6f %11.4f %10.3f %8.2fx %9.4f\n",
+                        versions[vi].name, s.approximation, min_ns, gsamples, speedup, spread_ns);
             std::fflush(stdout);
         }
-
-
     }
 }

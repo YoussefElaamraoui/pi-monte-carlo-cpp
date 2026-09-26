@@ -1,5 +1,7 @@
 #include <cstdlib>
+#include <omp.h>
 #include "versions.hpp"
+
 
 /*Baseline version*/
 double mc_pi_v0(long n_samples) {
@@ -136,4 +138,70 @@ double mc_pi_v3(long n_samples) {
     uint64_t total_hits = vaddvq_u32(hits);
 
     return 4.0 * total_hits / n_samples;
+}
+
+
+// Version 4 : Multi core (OpenMP Multi-Core)
+// As already said, simple because the cores do not share data, just in the end there is the sum of hits
+double mc_pi_v4(long n_samples) {
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t inv_scale = vdupq_n_f32(0x1p-24f);
+    const uint32x4_t M = vdupq_n_u32(1664525);
+    const uint32x4_t C = vdupq_n_u32(1013904223);
+
+    const long total_vec_iters = n_samples / 4;
+    uint64_t global_hits = 0;
+
+#pragma omp parallel reduction(+:global_hits)
+    {
+        int tid = omp_get_thread_num();
+
+        uint64_t z = 42 + tid;
+
+        uint32_t sx[4] = {splitmix32(z), splitmix32(z), splitmix32(z), splitmix32(z)};
+        uint32_t sy[4] = {splitmix32(z), splitmix32(z), splitmix32(z), splitmix32(z)};
+
+        uint32x4_t statex = vld1q_u32(sx);
+        uint32x4_t statey = vld1q_u32(sy);
+
+        uint32x4_t local_hits = vdupq_n_u32(0);
+
+#pragma omp for schedule(static)
+        for (long i = 0; i < total_vec_iters; ++i) {
+            float32x4_t x = next_float4(statex, M, C, inv_scale);
+            float32x4_t y = next_float4(statey, M, C, inv_scale);
+
+            float32x4_t r = vmulq_f32(x, x);
+            r = vfmaq_f32(r, y, y);
+
+            uint32x4_t mask = vcleq_f32(r, one);
+            local_hits = vsubq_u32(local_hits, mask);
+        }
+
+        global_hits += vaddvq_u32(local_hits);
+    }
+
+    return 4.0 * (double) global_hits / n_samples;
+}
+
+
+// Wrappers to call the Version 4 with different number of threads
+double mc_pi_v4_1t(long n) {
+    omp_set_num_threads(1);
+    return mc_pi_v4(n);
+}
+
+double mc_pi_v4_2t(long n) {
+    omp_set_num_threads(2);
+    return mc_pi_v4(n);
+}
+
+double mc_pi_v4_4t(long n) {
+    omp_set_num_threads(4);
+    return mc_pi_v4(n);
+}
+
+double mc_pi_v4_8t(long n) {
+    omp_set_num_threads(8);
+    return mc_pi_v4(n);
 }

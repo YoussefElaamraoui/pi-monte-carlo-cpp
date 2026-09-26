@@ -5,6 +5,10 @@
 [![Build](https://img.shields.io/badge/Build-CMake%20Release-green.svg)](https://cmake.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+<p align="center">
+  <img src="docs/images/pi_monte_carlo.gif" width="380" alt="Monte Carlo pi simulation converging to 3.14159"/>
+</p>
+
 This project estimates $\pi$ with a Monte Carlo method and then optimizes the same calculation step by step.
 
 While estimating $\pi$ is a simple, embarrassingly parallel toy problem, it serves as a perfect sandbox for exploring

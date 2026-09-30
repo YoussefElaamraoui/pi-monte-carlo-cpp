@@ -370,7 +370,6 @@ Results — minimum of 6 runs, Tesla T4 on Colab, kernel time in ms:
 | $10^8$ |               0.348 |              0.346 |                0.344 |      1.0×       |
 | $10^9$ |               3.403 |              3.379 |                3.389 |      1.0×       |
 
-As predicted no change at all, except for 10^6 and 10^7. Why?
 
 ![v5.1 reduction speedup over the atomic, across N](images/v5_1_atomics.svg)
 

@@ -6,7 +6,10 @@ is in [`Approach.md`](images/Approach.md).
 
 ---
 
-## Introduction : Profiling on macOS
+<details>
+<summary><b>How I profiled — tools &amp; method on macOS</b></summary>
+
+<br>
 
 ### Tool Selection & macOS Constraints
 
@@ -36,6 +39,8 @@ landed in `rand()`,".
 ### Sampling Implications & Duration
 
 Consequence: the interesting part has to run *long enough* to collect enough samples.
+
+</details>
 
 ---
 
@@ -83,8 +88,8 @@ is why a small PRNG in a header inlines beautifully and libc's rand() never can.
 
 ### The Problem
 
-Now that I verified also with the profiler, Instruments, the rand influence on the execution time, I have to decide
-which generator to use instead. With Claude's help I came up with this list:
+With `rand()` confirmed as the bottleneck, the next choice is the replacement generator. Evaluated PRNG alternatives
+for the scalar loop:
 
 | Generator       | State  | Speed     | Quality                         | Get-it-wrong risk | Notes                                                                                           |
 |-----------------|--------|-----------|---------------------------------|-------------------|-------------------------------------------------------------------------------------------------|
@@ -139,31 +144,19 @@ overhead is exactly what dominates.
 
 ## v2 — Remove the Branch
 
-### The Problem
+Branch mispredictions carry a high pipeline cost, so I assumed refactoring the hit test to drop the `if`
+(`count += (x*x + y*y <= 1.0)`) would improve throughput.
 
-This came from an assumption. Thanks to the ACA course at Politecnico di Milano I'd
-learned how costly `if`s and branch mispredictions can be, so my first idea was to
-refactor the hit test to drop the `if` (`count += (x*x + y*y <= 1.0)`).
+Manual branchless refactoring yielded **zero** speedup — and the assembly shows why. v1 and v2 compile byte-for-byte
+identical: `clang -O3` had already lowered the `if` to a `cinc` (conditional increment). The hit test in both is:
 
-But this runs into something I said earlier about profiling: a sampling profiler
-won't show a branch cost ( misprediction, a cache miss, a stalled pipeline). The Time Profiler sees the symptom (time),
-not the cause.
+```asm
+fcmp    d1, d0        ; compare  r = x*x + y*y  against  1.0
+cinc    x8, x8, ls    ; count += 1 if (r <= 1.0)   -- no branch
+```
 
-To *see* the branch cost you need a different tool: a **hardware-counter
-profiler**. Modern CPUs have counters for low-level events, branch
-mispredictions, cache misses, instructions retired. On Linux `perf stat` prints
-these directly (a `branch-misses` line with a percentage), the standard way, and
-part of why HPC people live on Linux. On my Mac, Instruments has a *CPU Counters*
-instrument (a different template from the Time Profiler) that reads some of these,
-though Apple Silicon exposes them less freely than Intel/Linux, so it's fiddlier.
-
-### Solution & Results
-
-**Result: the assumption was wrong.**
-
-The time didn't change, I assume the compiler
-had *already* compiled the `if` into branchless code, so my "optimization" was a
-no-op. A useful negative result: worth knowing the compiler often gets there first.
+`cinc` adds 1 when the condition holds, with no branch — the only branch in the loop is the `b.ne` back-edge. The
+compiler beat the manual optimization.
 
 ---
 
@@ -191,7 +184,7 @@ Two ways to get there:
 values in one step from the current generator. To feed four lanes I need a PRNG
 variant that produces four streams in parallel.
 
-### Solution: 4-Lane LCG with Decoupled $X$ and $Y$ Streams
+### Solution: a 4-lane LCG with decoupled X and Y streams
 
 To saturate a 128-bit NEON vector register (which holds $4 \times 32$-bit integers), we advance 4 independent
 pseudo-random streams in lockstep using a Linear Congruential Generator (LCG):
@@ -240,6 +233,33 @@ computes $\pmod{2^{32}}$ for free in 32-bit registers.
    After the loop, `vaddvq_u32(hits)` performs a hardware horizontal reduction across the 4 lanes to yield the scalar
    total hit count.
 
+### What did the compiler do
+
+Same trick as v2: I read the assembly. The tell is the suffix `.4s` on nearly every instruction in the loop — it means
+"4 lanes of 32-bit float", i.e. four samples handled at once. Next to v1/v2 the contrast is obvious:
+
+| Feature | v1 / v2 (Scalar) | v3 (Vector NEON) |
+| :--- | :--- | :--- |
+| **Registers** | `d1`, `x8` (single value) | `v6.4s`, `v0.4s` (four values) |
+| **Multiply** | `fmul d1, d1, d1` | `fmul v6.4s, v6.4s, v6.4s` |
+| **Precision** | `d` = double (64-bit) | `.4s` = float (32-bit) |
+| **Loop trips** | $N$ | $N / 4$ (via `asr x8, x8, #2`) |
+
+The loop body, annotated:
+
+```asm
+mla    v5.4s, v6.4s, v2.4s   ; LCG step  state*M + C  for 4 X's at once (again below for Y)
+ucvtf  v6.4s, v7.4s, #24     ; convert 4 ints -> 4 floats in [0,1)
+fmla   v6.4s, v7.4s, v7.4s   ; x*x + y*y for 4 points in one fused multiply-add
+fcmge  v6.4s, v1.4s, v6.4s   ; hit-test 4 points at once -> a 4-lane mask
+sub    v0.4s, v0.4s, v6.4s   ; branchless accumulate (subtracting the -1 mask adds 1), 4 counters
+addv   s0, v0.4s             ; at loop exit: sum the 4 lane-counters into one scalar
+```
+
+So each pass through the loop does four samples, and the loop runs `n/4` times, where v1/v2 ran `n` times on single
+`d`-registers. That `.4s` everywhere — and the fact that `.4s` is single-precision, which also shows the double-to-float
+switch — is the vectorisation, in black and white.
+
 ---
 
 ## v4 — Multi-core (OpenMP)
@@ -260,6 +280,10 @@ guessing why, I benchmarked each thread count to locate the gap:
 | 2 | 1.98× | 99% |
 | 4 (P-cores) | 3.74× | 94% |
 | 8 (4P + 4E) | 4.70× | 59% |
+
+![v4 parallel scaling across threads](images/v4_scaling.svg)
+
+*Figure — parallel speedup vs. thread count.*
 
 **The finding.** Scaling is near-linear up to the 4 *performance* cores (94% efficiency). The 4 *efficiency* cores then
 add real but **sub-linear** throughput — 8 threads gives 4.70×, not 8× — because an E-core is much slower than a P-core.
@@ -309,43 +333,107 @@ a **throughput device**: the CPU wins the small jobs (low latency), the GPU wins
 is a single multiply (not `splitmix`), which is why the GPU's π error (~7×10⁻⁵) is a touch higher than the CPU's.
 
 
-### Empirical Results
+---
 
-![v3 benchmark in CLion](images/v3_clion_output.png)
+## v5.1 — GPU: does the atomic combine actually cost anything?
 
-| Version | Device | Approx π | ns/sample | Throughput | Speedup |
-|:-------:|:------:|:--------:|----------:|-----------:|:-------:|
-| v0 | M1 (1 core) | 3.141610 | 14.713 | 0.068 G/s | 1.00× |
-| v1 | M1 (1 core) | 3.141617 | 2.144 | 0.47 G/s | 6.8× |
-| v2 | M1 (1 core) | 3.141617 | 2.127 | 0.47 G/s | 6.9× |
-| v3 | M1 (1 core) | 3.141582 | 0.316 | 3.16 G/s | 46× |
-| **v4** | M1 (8 cores) | 3.141578 | **0.067** | **14.9 G/s** | **217×** |
-| **v5** | Tesla T4 GPU | 3.141667 | **0.0055** | **180 G/s** | **~2,650×** |
+v5 finishes with every thread calling `atomicAdd` on one global counter — 65,536 serialized adds on a single address. The textbook fix is a block-level reduction: each block sums its threads' counts in fast shared memory, then only one thread per block touches global memory (256 atomics instead of 65,536).
 
-*All at $N = 10^9$. **Throughput** = 1 / (ns per sample) — the samples-per-second the kernel sustains, and the most
-intuitive column: 68 million/s (v0) climbs to 180 billion/s (v5). ns/sample is min-of-10 for the CPU, single-run for the
-GPU. v4's per-thread-count scaling (1/2/4/8) is in the v4 section; v5 across sample sizes is in the v5 section. v5 is a
-different device (T4 GPU vs M1 laptop), so its speedup compares devices, not the same silicon.*
+Prediction, written before measuring: little or no change. Each thread does its counting in registers inside the loop and touches the global counter only once, at the very end. That is 65,536 atomics against 1,000,000,000 loop iterations — a ratio of about 15,000 to 1 in favour of the loop. A cost can only dominate if it sits inside the hot loop, and this one does not.
 
-### Microarchitectural Analysis: Cracking the Sub-Nanosecond Barrier
+To confirm instead of assuming, I compare three combine strategies at each N:
+- per-thread atomic (v5, the baseline);
+- per-block reduction (shared memory + one atomic per block);
+- no atomic at all (ablation): each thread writes its count to its own global slot, so the work stays live but there is zero contention.
 
-* **Clock Cycle Budget**: On an Apple M1 Firestorm core running at $\approx 3.2\text{ GHz}$, 1
-  cycle $\approx 0.3125\text{ ns}$.
-  $$\text{Cycles per Sample} = \frac{0.316\text{ ns}}{0.3125\text{ ns}} \approx \mathbf{1.01\text{ cycles}}$$
-  Because each iteration processes 4 samples, one loop iteration executes
-  in $\approx \mathbf{4.05\text{ clock cycles}}$.
-* **Vector IPC (Instructions Per Cycle)**: The hot loop executes ~12 vector instructions (2 LCG steps, 2 bit-shifts, 2
-  conversions, 2 multiplications, 1 FMA, 1 comparison, 1 subtraction, loop overhead) in ~6.5 cycles, sustaining an
-  impressive Vector IPC of $\approx \mathbf{3.0}$.
-* **Zero Cache Interactions**: All 4 states, constants, and accumulator registers reside completely inside NEON
-  registers `q0–q31`. The spread across 10 runs at $N=10^9$ is just **$0.0013\text{ ns}$**, demonstrating zero cache
-  thrashing or pipeline stalls.
+The reduction kernel:
+
+```cuda
+__global__ void mc_kernel_reduce(long n, unsigned long long *global_count) {
+    int id     = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x  * blockDim.x;
+    uint32_t state = 42u + id * 2654435761u;
+    unsigned int local = 0;
+    for (long i = id; i < n; i += stride) {
+        float x = rng(state), y = rng(state);
+        if (x*x + y*y <= 1.0f) local++;
+    }
+
+    __shared__ unsigned int tile[256];             // one slot per thread (block size = 256)
+    tile[threadIdx.x] = local;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { // tree reduction: halve each step
+        if (threadIdx.x < s) tile[threadIdx.x] += tile[threadIdx.x + s];
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)                           // one atomic per block, not per thread
+        atomicAdd(global_count, (unsigned long long) tile[0]);
+}
+```
+
+Results — minimum of 6 runs, Tesla T4 on Colab, kernel time in ms:
+
+| N | atomic (per thread) | reduce (per block) | ablation (no atomic) | atomic ÷ reduce |
+|--:|--:|--:|--:|:-:|
+| $10^6$ | 0.088 | 0.027 | 0.020 | 3.3× |
+| $10^7$ | 0.094 | 0.043 | 0.040 | 2.2× |
+| $10^8$ | 0.348 | 0.346 | 0.344 | 1.0× |
+| $10^9$ | 3.403 | 3.379 | 3.389 | 1.0× |
+
+Note on the data: absolute times swing heavily run-to-run because the Colab GPU is shared — the same $10^9$ job ranged from
+3.4 ms to 5.9 ms across runs (a 1.7x spread). So the reliable signal is the *ratio within* each run, not the absolute number
+across runs; the ratios above are stable across all 6 runs.
+
+![v5.1 reduction speedup over the atomic, across N](images/v5_1_atomics.svg)
+
+*Figure — the block-reduction's advantage over the per-thread atomic shrinks from 3.3x at $10^6$ to nothing by $10^8$, once per-thread work is large enough to stagger the atomics.*
+
+What actually happens splits into two cases, and the cause is not the *number* of atomic writes — that is always
+65,536 — but *when* they arrive.
+
+At small N ($10^6$–$10^7$) each thread has almost nothing to do: roughly 15 to 150 samples. So all 65,536 threads finish
+their tiny loops at nearly the same instant, and then they all try to add into the single global counter at once. Those
+additions are forced to happen one at a time — that is exactly what makes `atomicAdd` safe — so they pile up into a
+queue, and on a kernel this short that queue is a real slice of the total time. The block-reduction sidesteps it: each
+block adds up its own 256 threads first, so only 256 additions ever reach the global counter instead of 65,536. That is
+why it comes out 2–3× faster here.
+
+At large N ($10^8$–$10^9$) each thread runs a long loop instead — around 15,000 samples. Now the threads finish at very
+different moments, spread across the whole run, so their additions trickle into the counter one by one rather than all
+at once. There is no pile-up to avoid, so the reduction saves nothing. And the loop is doing so much more work than the
+combine — about 15,000 loop steps for every single atomic — that the atomic simply vanishes into it.
+
+The turning point is between $10^7$ and $10^8$: once each thread handles more than about 1,500 samples, the threads
+finish spread out enough that the burst never forms.
+
+The honest takeaway: from the 15,000-to-1 ratio I predicted the atomics wouldn't matter, and that held at the sizes that
+actually matter — but I only found the small-N case, where they *do* matter, by measuring it.
+
+### Results
+
+![Cost per sample across optimization stages](images/benchmark_scientific.svg)
+
+*Figure — cost per sample, v0 to v5 (log scale); v0–v4 on the M1, v5 on the T4 GPU.*
+
+
+
+<details>
+<summary><b>Raw benchmark output (CLion)</b></summary>
+
+<br>
+
+![Raw pi_bench output in CLion](images/v3_clion_output.png)
+
+</details>
+
 
 ### Engineering Trade-Offs
 
 * **LCG vs PCG32**: LCG is extremely cheap (a single fused multiply-add) and fits SIMD naturally. However, in
   higher-dimensional Monte Carlo problems, LCG suffers from the Marsaglia defect (points falling on parallel
-  hyperplanes). For 2D $\pi$ with separate initial seeds, accuracy is preserved ($\epsilon \approx 10^{-5}$ at $10^9$),
+  hyperplanes). For 2D Monte Carlo with separate initial seeds, accuracy is preserved (error $\approx 10^{-5}$ at $N=10^9$),
   but scientific simulations often prefer counter-based PRNGs (like Philox).
 * **Instruction Portability**: Intrinsics in `<arm_neon.h>` are specific to ARM64. Supporting x86 architectures requires
   mapping to AVX2/AVX-512 (`_mm256_*`) or utilizing cross-platform SIMD wrappers like Google Highway.

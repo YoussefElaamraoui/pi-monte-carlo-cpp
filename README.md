@@ -38,7 +38,7 @@ At $10^{9}$ (1 billion) samples. Throughput — samples processed per second —
 
 ![Figure 1: cost per sample across optimization stages](docs/images/benchmark_scientific.svg)
 
-<sub>**Figure 1** — cost per sample, v0→v4 (Apple M1) and v5 (Tesla T4 GPU). Log scale, lower is better.</sub>
+<sub>**Figure 1** — speedup, v0→v4 (Apple M1) and v5 (Tesla T4 GPU). Log scale, lower is better.</sub>
 
 ---
 
@@ -173,6 +173,10 @@ docs/
 
 If you found this useful, a star is appreciated. I'm always looking to improve — if you spot an inaccuracy or have an
 idea for another optimization step, open an issue.
+
+Thank you for you attention ! :)
+
+Youssef El aamraoui
 
 ## License
 

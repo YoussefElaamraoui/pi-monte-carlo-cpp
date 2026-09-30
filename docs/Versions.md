@@ -54,33 +54,18 @@ rand and its machinery are clearly the bottleneck. Reading the profile carefully
 total (79%), and inside that the RNG cost is split across three rows:
 
 1) rand itself → 711 ms
-2) DYLD-STUB$$rand → 380 ms. The stub: because rand lives in a shared library, my code can't jump straight to it, it
-   jumps
-   into the library, and pays that indirection on every call( This ~380 ms is the
-   total across all calls, not the cost of one)
+2) DYLD-STUB$$rand → 380 ms.
 3) a second rand entry → 339 ms
 
-Together those three are ~1430 ms, about **88% of the total runtime**. Meanwhile mc_pi_v0 is only 201
-ms, so only ~12% of the runtime.
+Number (2) is the cost of all calls to the library that has rand.
 
-### Solution & result
+Together those three are ~1430 ms, about 88% of the total runtime.
+Meanwhile, mc_pi_v0 is only 201 ms, so only ~12% of the runtime.
 
-Prediction for v1: since my real work is only ~200 ms, if the RNG became essentially free I'd expect to land near
-there, roughly a 3× speedup. I'm writing that down before measuring, so afterwards I can tell whether v1 succeeded or
-whether I left performance on the table.
+### Prediction for v1:
 
-std::rand() lives in libc, compiled separately months before my program. My compiler only sees a declaration — a promise
-that a function named rand exists somewhere — not its body. So the call is an optimization barrier. The compiler must
-assume the worst: it can't reorder my arithmetic across the call, can't keep values in registers through it, and —
-crucially — can't vectorize the loop (SIMD does several iterations at once, but each iteration calls rand, which must
-run in sequence). The call freezes the optimizer.
-
-Inlining is when the compiler copies a function's body straight into the call site, as if you'd typed it there. Then the
-barrier vanishes and it can optimize across the whole loop. But inlining requires the compiler to see the source, which
-is why a small PRNG in a header inlines beautifully and libc's rand() never can.
-
-
-
+Since, mc_pi_v0, is only ~200 ms, if the RNG became essentially free I'd expect to land near
+there, roughly a 3× speedup.
 
 ---
 
@@ -91,63 +76,29 @@ is why a small PRNG in a header inlines beautifully and libc's rand() never can.
 With `rand()` confirmed as the bottleneck, the next choice is the replacement generator. Evaluated PRNG alternatives
 for the scalar loop:
 
-| Generator       | State  | Speed     | Quality                         | Get-it-wrong risk | Notes                                                                                           |
-|-----------------|--------|-----------|---------------------------------|-------------------|-------------------------------------------------------------------------------------------------|
-| xorshift32/64   | 4–8 B  | very fast | adequate, some known weaknesses | low               | Classic "simplest fast PRNG," ~3 shifts + XORs. Fails some strict tests but fine for π.         |
-| splitmix64      | 8 B    | very fast | good                            | very low          | One multiply-shift-xor chain. Often used to seed others, but fine standalone here.              |
-| **PCG32**       | 8–16 B | fast      | high                            | low-medium        | Well-documented, passes strong batteries. A multiply + a permutation step. The "solid default." |
-| xoshiro256++/** | 32 B   | very fast | high                            | medium            | Modern, excellent quality/speed. Bigger state; must avoid an all-zero seed.                     |
+| Generator       | State  | Speed     | Quality                         | Get-it-wrong risk | Notes                                                                                          |
+|-----------------|--------|-----------|---------------------------------|-------------------|------------------------------------------------------------------------------------------------|
+| xorshift32/64   | 4–8 B  | very fast | adequate, some known weaknesses | low               | Classic "simplest fast PRNG," ~3 shifts + XORs. Fails some strict tests but fine for π         |
+| splitmix64      | 8 B    | very fast | good                            | very low          | One multiply-shift-xor chain. Often used to seed others, but fine standalone here              |
+| PCG32           | 8–16 B | fast      | high                            | low-medium        | Well-documented, passes strong batteries. A multiply + a permutation step. The "solid default" |
+| xoshiro256++/** | 32 B   | very fast | high                            | medium            | Modern, excellent quality/speed. Bigger state; must avoid an all-zero seed                     |
 
-> Note: All of these are **pseudo-random**, deterministic formulas imitating randomness.
+> Note: All of these are pseudo-random, deterministic formulas imitating randomness.
 
-### Solution & Results
+### Decision: PCG32.
 
-**Decision: PCG32.** Quality isn't the deciding factor here (π is forgiving), so
-the choice came down to the generator I'll actually reach for in real work *where
-quality does matter* — PCG is well-documented, only a little more code, and
-getting comfortable with it now is transferable. Its main risk is
-seeding/constants, so my **correctness check** for v1 is: π must converge to
-~3.14159 **and** the error must shrink roughly like `1/√n`. If that holds, the
-seeding is right; if π drifts, I got it wrong.
-
-### Questions
-
-#### Why the PCG Code Lives in the Header
-
-**Why the PCG code lives in the header, not the `.cpp`:** including a header copies
-the code into the translation unit, so it can inline right at the call site — and
-as the v0 profile showed, in this workload (small samples, lots of calls) the call
-overhead is exactly what dominates.
-
-> Rule of thumb I'm taking away: **small + called in a hot loop → inline it → put
-> it in a header. Big function → don't inline → `.cpp`.**
-
-#### What the Columns Mean
-
-* **Quality** → how convincingly the sequence imitates true randomness:
-  *uniformity* (are all values equally likely?), *independence* (can you predict
-  the next from the previous? — matters here because I pair consecutive outputs
-  into `(x, y)`, so 2D correlation would directly skew π), and *period* (finite
-  state means it eventually loops; the period is how long until it does). Quality
-  isn't opinion — it's measured by test batteries (TestU01, PractRand).
-  For π specifically it's almost a non-issue; every generator here clears the bar.
-  Quality would dominate for cryptography (predictability = broken) or
-  high-dimensional physics (subtle correlations = wrong results). Knowing *when*
-  quality matters is the real skill.
-* **Get-it-wrong risk** → how easy it is to implement *incorrectly* in a way that
-  still compiles, still runs, and still produces plausible-but-wrong numbers.
-  Silent bugs, not crashes. E.g. xoshiro outputs zeros forever if seeded all-zero.
-  For PCG the trap is the seeding step and its published constants — get one wrong
-  and it still looks random-ish but isn't really PCG.
-
----
+Quality isn't the deciding factor here (π is forgiving), so
+the choice came down to PCG, which is a well-documented generator.
+Its main risk is seeding/constants, so my correctness check for v1 is: π must converge to
+~3.14159 and the error must shrink roughly like `1/√n`, which is Monte Carlo's rate of convergence
 
 ## v2 — Remove the Branch
 
-Branch mispredictions carry a high pipeline cost, so I assumed refactoring the hit test to drop the `if`
+During my course in ACA (Advanced Computer Architecture at Polimi) the professors highlighted the fact that branch
+mispredictions carry a high pipeline cost, so I assumed refactoring the hit test to drop the `if`
 (`count += (x*x + y*y <= 1.0)`) would improve throughput.
 
-Manual branchless refactoring yielded **zero** speedup — and the assembly shows why. v1 and v2 compile byte-for-byte
+Manual branchless refactoring yielded 0 speedup — and the assembly shows why. v1 and v2 compile byte-for-byte
 identical: `clang -O3` had already lowered the `if` to a `cinc` (conditional increment). The hit test in both is:
 
 ```asm
@@ -158,16 +109,18 @@ cinc    x8, x8, ls    ; count += 1 if (r <= 1.0)   -- no branch
 `cinc` adds 1 when the condition holds, with no branch — the only branch in the loop is the `b.ne` back-edge. The
 compiler beat the manual optimization.
 
+I did not expect much improvement/speed up here, nonetheless learning that there are already optimizations like these
+caught me by surprise, rookie mistake.
+
 ---
 
 ## v3 — SIMD
 
 ### The Problem
 
-Right now each instruction runs on one piece of data at a time. **SIMD** (Single
+Until now each instruction ran on one piece of data at a time. SIMD(Single
 Instruction, Multiple Data) is exactly the situation I'm in: one instruction (ex: multiply) applied to multiple data
-lanes at once. So instead of processing
-sample `i`, I process samples `i, i+1, i+2, i+3` together.
+lanes at once. So instead of processing sample `i`, I process samples `i, i+1, i+2, i+3` together.
 
 Two ways to get there:
 
@@ -179,10 +132,11 @@ Two ways to get there:
   exactly what the CPU does. This is the "learn it properly" path, and the one I
   want.
 
-**The catch:** SIMD wants four `(x, y)` values at once, but a PRNG's outputs are
-*sequential*, which means each state depends on the previous, so I can't get four independent
-values in one step from the current generator. To feed four lanes I need a PRNG
-variant that produces four streams in parallel.
+The only issue is SIMD wants four `(x, y)` values at once, but a PRNG's outputs are
+sequential, which means each state depends on the previous, so I can't get four independent
+values in one step from the current generator.
+
+To feed four lanes I need a PRNG variant that produces four streams in parallel.
 
 ### Solution: a 4-lane LCG with decoupled X and Y streams
 
@@ -193,8 +147,6 @@ $$\text{state}_{t+1} = (\text{state}_t \times M + C) \pmod{2^{32}}$$
 
 With Numerical Recipes constants ($M = 1664525, C = 1013904223$), the multiplication overflow natively
 computes $\pmod{2^{32}}$ for free in 32-bit registers.
-
-
 
 #### Key Architectural Components:
 
@@ -233,17 +185,19 @@ computes $\pmod{2^{32}}$ for free in 32-bit registers.
    After the loop, `vaddvq_u32(hits)` performs a hardware horizontal reduction across the 4 lanes to yield the scalar
    total hit count.
 
-### What did the compiler do
+### Am I sure it worked?
 
-Same trick as v2: I read the assembly. The tell is the suffix `.4s` on nearly every instruction in the loop — it means
+In order to be sure, about the vectorization I used the same trick as v2: I read the assembly.
+
+The tell is the suffix `.4s` on nearly every instruction in the loop — it means
 "4 lanes of 32-bit float", i.e. four samples handled at once. Next to v1/v2 the contrast is obvious:
 
-| Feature | v1 / v2 (Scalar) | v3 (Vector NEON) |
-| :--- | :--- | :--- |
-| **Registers** | `d1`, `x8` (single value) | `v6.4s`, `v0.4s` (four values) |
-| **Multiply** | `fmul d1, d1, d1` | `fmul v6.4s, v6.4s, v6.4s` |
-| **Precision** | `d` = double (64-bit) | `.4s` = float (32-bit) |
-| **Loop trips** | $N$ | $N / 4$ (via `asr x8, x8, #2`) |
+| Feature        | v1 / v2 (Scalar)          | v3 (Vector NEON)               |
+|:---------------|:--------------------------|:-------------------------------|
+| **Registers**  | `d1`, `x8` (single value) | `v6.4s`, `v0.4s` (four values) |
+| **Multiply**   | `fmul d1, d1, d1`         | `fmul v6.4s, v6.4s, v6.4s`     |
+| **Precision**  | `d` = double (64-bit)     | `.4s` = float (32-bit)         |
+| **Loop trips** | $N$                       | $N / 4$ (via `asr x8, x8, #2`) |
 
 The loop body, annotated:
 
@@ -267,84 +221,118 @@ switch — is the vectorisation, in black and white.
 v4 keeps the v3 SIMD kernel byte-for-byte and only spreads its iterations across cores with OpenMP, so any speedup is
 *pure parallelism* — nothing else changed. (v4 on one thread matches v3 to within noise, which is the proof of that.)
 
-**How it works.** `#pragma omp parallel` forks a team of threads from a reused pool (not new OS threads per call); each
+### **How it works.**
+
+`#pragma omp parallel` forks a team of threads from a reused pool (not new OS threads per call); each
 thread seeds its own RNG from `omp_get_thread_num()`, runs its slice of the loop, and `reduction(+:hits)` gives every
 thread a private counter that the runtime sums once at the end — accumulate locally, combine once, so there is no false
 sharing on the global count.
 
-**Prediction → result.** The M1 has **4 performance + 4 efficiency cores**. I hoped for ~8×; I measured ~4.7×. Instead of
-guessing why, I benchmarked each thread count to locate the gap:
+### What I discovered
 
-| Threads | speedup vs 1 thread | efficiency |
-|:-------:|:-------------------:|:----------:|
-| 2 | 1.98× | 99% |
-| 4 (P-cores) | 3.74× | 94% |
-| 8 (4P + 4E) | 4.70× | 59% |
+Look at this table:
+
+|   Threads   | speedup vs 1 thread | efficiency |
+|:-----------:|:-------------------:|:----------:|
+|      2      |        1.98×        |    99%     |
+| 4 (P-cores) |        3.74×        |    94%     |
+| 8 (4P + 4E) |        4.70×        |    59%     |
+
+This is the speedup per thread used. Something here caught my eye, something I did not know.
+Before running the experiment I assumed i would have had a linear improvement, but this did not happen.
+Instead I got a linear improvement until the 4th core, then a plateau. The reason are the M1 cores. It has 4 performance
+cores and then 4 efficiency cores, the performance cores are the reason behind the linear speed up and the efficiency
+cores behind the plateau. It's more obvious by looking at the graph below.
 
 ![v4 parallel scaling across threads](images/v4_scaling.svg)
 
 *Figure — parallel speedup vs. thread count.*
 
-**The finding.** Scaling is near-linear up to the 4 *performance* cores (94% efficiency). The 4 *efficiency* cores then
-add real but **sub-linear** throughput — 8 threads gives 4.70×, not 8× — because an E-core is much slower than a P-core.
-The "missing" speedup isn't a bug in the code; it's the heterogeneous chip. (macOS also gives no way to pin threads to
-specific cores, so which thread lands on which core is the scheduler's call.)
+Scaling is near-linear up to the 4 performance cores (94% efficiency). The 4 *efficiency* cores then
+add real but sub-linear throughput — 8 threads gives 4.70×, not 8× — because an E-core is much slower than a P-core.
 
 ---
 
 ## v5 — GPU (CUDA)
 
-v4 saturated the CPU, so v5 changes the *machine*: a GPU trades a handful of fast cores for **thousands of slow ones**.
-The same LCG kernel, rewritten in CUDA and run on a **Tesla T4** (Google Colab), reaches **180 Gsample/s** — about **12×
-the best CPU (v4)** and ~2,650× v0.
+I felt like the v4 saturated the CPU, in order to gain more performance speed up, I decided to deep dive into GPU
+performance improvement.
+Working with CPU cores is like working with specialized labor, few cores but the best ones. While working with GPU is
+cheap labor, however the number of cores is much higher.
 
-### What makes it a GPU program (not just parallel)
+Since my M1 lacks CUDA support, I needed to transition to a cloud environment to leverage massive GPU parallelism. A GPU
+trades a handful of fast cores for thousands of slow ones. The same LCG kernel, rewritten in CUDA and run on a Tesla
+T4 (Google Colab).
+
+The same LCG kernel, rewritten in CUDA and run on a Tesla T4 (Google Colab), reaches **180 Gsample/s** — about 12×
+the best CPU (v4) and ~2,650× v0.
+
+### What makes it a GPU program
 
 - **SIMT, not SIMD.** Threads run in lock-step groups of 32 (a *warp*): I write plain scalar code and the hardware runs
   32 lanes at once. It's v3's SIMD idea, but the hardware does the vectorizing for me.
+
+
 - **Latency hiding by oversubscription.** Each thread's LCG is a slow dependent chain. The GPU hides that by keeping
   thousands of threads resident and switching warps whenever one stalls — which is exactly why a GPU needs a *lot* of
   work to be fast.
+
+
 - **Grid-stride loop.** A fixed grid (256 × 256 = 65,536 threads) walks the array in strides of `total_threads`, so one
   launch covers any `N`.
+
 - **One `atomicAdd` per thread.** Each thread keeps a private `local` count and adds it to the global counter *once*, at
   the end — the same "combine once" idea as v4's reduction, so atomic contention stays negligible.
 
 ### What I chose to measure
 
-There are two honest numbers. **Kernel-only time** (`cudaEvent` around the launch) is pure compute — the fair match to
-the CPU `ns/sample`, which was also pure compute. **End-to-end time** would add `cudaMalloc` and the copy back (the
-"real world" number). For Monte Carlo π they're nearly identical — the only host↔device transfer is a single counter —
-so I report **kernel-only**. The first launch is slow because CUDA does one-time context setup, so I run a throwaway
+There are two honest numbers.
+
+1) **Kernel-only time** (`cudaEvent` around the launch) is pure compute — the fair match to
+   the CPU `ns/sample`, which was also pure compute.
+
+
+2) **End-to-end time** would add `cudaMalloc` and the copy back (the
+   "real world" number). For Monte Carlo π they're nearly identical
+   so I report kernel-only.
+
+Note : The first launch is slow because CUDA does one-time context setup, so I run a throwaway
 **warm-up** first, then time.
 
 ### Results (Tesla T4, kernel time)
 
-| Samples | Kernel time | Throughput | Approx π |
-|--------:|------------:|-----------:|:--------:|
-| $10^6$ | 0.109 ms | 9 Gsample/s | 3.141536 |
-| $10^7$ | 0.121 ms | 83 Gsample/s | 3.141678 |
-| $10^8$ | 0.565 ms | 177 Gsample/s | 3.141682 |
-| $10^9$ | 5.549 ms | **180 Gsample/s** | 3.141667 |
-
-Notice the **warm-up curve**: at $10^6$ the GPU manages only ~9 Gsample/s — 65,536 threads over a fixed launch cost have
-too little work to amortize — and throughput climbs until it saturates near $10^8$–$10^9$. That is the defining trait of
-a **throughput device**: the CPU wins the small jobs (low latency), the GPU wins the big ones. The per-thread seed here
-is a single multiply (not `splitmix`), which is why the GPU's π error (~7×10⁻⁵) is a touch higher than the CPU's.
-
+| Samples | Kernel time |        Throughput | Approx π |
+|--------:|------------:|------------------:|:--------:|
+|  $10^6$ |    0.109 ms |       9 Gsample/s | 3.141536 |
+|  $10^7$ |    0.121 ms |      83 Gsample/s | 3.141678 |
+|  $10^8$ |    0.565 ms |     177 Gsample/s | 3.141682 |
+|  $10^9$ |    5.549 ms | **180 Gsample/s** | 3.141667 |
 
 ---
 
 ## v5.1 — GPU: does the atomic combine actually cost anything?
 
-v5 finishes with every thread calling `atomicAdd` on one global counter — 65,536 serialized adds on a single address. The textbook fix is a block-level reduction: each block sums its threads' counts in fast shared memory, then only one thread per block touches global memory (256 atomics instead of 65,536).
+After finishing v5, I had one main concern: is the atomic combine hindering performance?
 
-Prediction, written before measuring: little or no change. Each thread does its counting in registers inside the loop and touches the global counter only once, at the very end. That is 65,536 atomics against 1,000,000,000 loop iterations — a ratio of about 15,000 to 1 in favour of the loop. A cost can only dominate if it sits inside the hot loop, and this one does not.
+Think of it this way: the atomic combine does exactly one thing. It forces the counted results into memory one at a
+time (65,536 serialized additions on
+a single address).
+This guarantees safety, but comes with a major caveat: if all those additions hit the memory address
+simultaneously, the resulting queue could severely bottleneck execution.
 
-To confirm instead of assuming, I compare three combine strategies at each N:
-- per-thread atomic (v5, the baseline);
-- per-block reduction (shared memory + one atomic per block);
-- no atomic at all (ablation): each thread writes its count to its own global slot, so the work stays live but there is zero contention.
+I predicted little to no impact, but I needed empirical proof.
+
+To test this, I compared three combine strategies across different values of $N$:
+
+- Per-thread atomic (v5,
+  the baseline);
+
+
+- Per-block reduction (shared memory + one atomic per block);
+
+
+- No atomic at all (ablation): each thread writes
+  its count to its own global slot. The computation stays live, but memory contention drops to zero.
 
 The reduction kernel:
 
@@ -375,47 +363,57 @@ __global__ void mc_kernel_reduce(long n, unsigned long long *global_count) {
 
 Results — minimum of 6 runs, Tesla T4 on Colab, kernel time in ms:
 
-| N | atomic (per thread) | reduce (per block) | ablation (no atomic) | atomic ÷ reduce |
-|--:|--:|--:|--:|:-:|
-| $10^6$ | 0.088 | 0.027 | 0.020 | 3.3× |
-| $10^7$ | 0.094 | 0.043 | 0.040 | 2.2× |
-| $10^8$ | 0.348 | 0.346 | 0.344 | 1.0× |
-| $10^9$ | 3.403 | 3.379 | 3.389 | 1.0× |
+|      N | atomic (per thread) | reduce (per block) | ablation (no atomic) | atomic ÷ reduce |
+|-------:|--------------------:|-------------------:|---------------------:|:---------------:|
+| $10^6$ |               0.088 |              0.027 |                0.020 |      3.3×       |
+| $10^7$ |               0.094 |              0.043 |                0.040 |      2.2×       |
+| $10^8$ |               0.348 |              0.346 |                0.344 |      1.0×       |
+| $10^9$ |               3.403 |              3.379 |                3.389 |      1.0×       |
 
-Note on the data: absolute times swing heavily run-to-run because the Colab GPU is shared — the same $10^9$ job ranged from
-3.4 ms to 5.9 ms across runs (a 1.7x spread). So the reliable signal is the *ratio within* each run, not the absolute number
-across runs; the ratios above are stable across all 6 runs.
+As predicted no change at all, except for 10^6 and 10^7. Why?
 
 ![v5.1 reduction speedup over the atomic, across N](images/v5_1_atomics.svg)
 
-*Figure — the block-reduction's advantage over the per-thread atomic shrinks from 3.3x at $10^6$ to nothing by $10^8$, once per-thread work is large enough to stagger the atomics.*
+*Figure — the block-reduction's advantage over the per-thread atomic shrinks from 3.3x at $10^6$ to nothing by $10^8$,
+once per-thread work is large enough to stagger the atomics.*
 
-What actually happens splits into two cases, and the cause is not the *number* of atomic writes — that is always
-65,536 — but *when* they arrive.
+### Why is there a change in performance ?
 
-At small N ($10^6$–$10^7$) each thread has almost nothing to do: roughly 15 to 150 samples. So all 65,536 threads finish
-their tiny loops at nearly the same instant, and then they all try to add into the single global counter at once. Those
-additions are forced to happen one at a time — that is exactly what makes `atomicAdd` safe — so they pile up into a
-queue, and on a kernel this short that queue is a real slice of the total time. The block-reduction sidesteps it: each
-block adds up its own 256 threads first, so only 256 additions ever reach the global counter instead of 65,536. That is
-why it comes out 2–3× faster here.
+My prediction held true for large datasets, but failed at $10^6$ and $10^7$. Why?
 
-At large N ($10^8$–$10^9$) each thread runs a long loop instead — around 15,000 samples. Now the threads finish at very
-different moments, spread across the whole run, so their additions trickle into the counter one by one rather than all
-at once. There is no pile-up to avoid, so the reduction saves nothing. And the loop is doing so much more work than the
-combine — about 15,000 loop steps for every single atomic — that the atomic simply vanishes into it.
+The behavior splits into two distinct
+regimes.
 
-The turning point is between $10^7$ and $10^8$: once each thread handles more than about 1,500 samples, the threads
-finish spread out enough that the burst never forms.
+#### Small samples
 
-The honest takeaway: from the 15,000-to-1 ratio I predicted the atomics wouldn't matter, and that held at the sizes that
-actually matter — but I only found the small-N case, where they *do* matter, by measuring it.
+At small $N$ ($10^6$–$10^7$), each thread has almost no work: roughly 15 to 150 samples.
+Consequently, all 65,536 threads
+finish their tiny loops at nearly the exact same instant and attempt to write to the single global counter
+simultaneously. Since atomicAdd forces these operations to happen sequentially, they pile up into a massive queue. In
+such a short kernel execution, this queueing delay consumes a significant fraction of total runtime. The block-reduction
+strategy bypasses this traffic jam: each block aggregates its 256 threads first, meaning only 256 additions ever reach
+the global counter instead of 65,536. This is why block-reduction is 2–3× faster here.
 
-### Results
+#### Bigger samples
+
+At large $N$ ($10^8$–$10^9$), each
+thread processes a long loop—around 15,000 samples.
+The threads now finish their work at slightly different moments,
+spread across the entire kernel execution. Their additions trickle into the counter one by one rather than all at once.
+Since there is no burst of traffic, there is no queue, and the block-reduction strategy saves nothing.
+
+Furthermore,
+because the loop performs 15,000 compute steps for every single atomic operation, the latency of the atomic write
+vanishes entirely into the compute time.The phase transition occurs between $10^7$ and $10^8$. Once a thread handles
+more than ~1,500 samples, completion times naturally desynchronize enough to prevent the burst from ever forming.
+
+It was a good result, something I should have seen coming, but it was fun to discover nonetheless.
+
+### Final Result
 
 ![Cost per sample across optimization stages](images/benchmark_scientific.svg)
 
-*Figure — cost per sample, v0 to v5 (log scale); v0–v4 on the M1, v5 on the T4 GPU.*
+*Figure — Speedup improvement*
 
 
 
@@ -428,13 +426,15 @@ actually matter — but I only found the small-N case, where they *do* matter, b
 
 </details>
 
-
 ### Engineering Trade-Offs
 
 * **LCG vs PCG32**: LCG is extremely cheap (a single fused multiply-add) and fits SIMD naturally. However, in
   higher-dimensional Monte Carlo problems, LCG suffers from the Marsaglia defect (points falling on parallel
-  hyperplanes). For 2D Monte Carlo with separate initial seeds, accuracy is preserved (error $\approx 10^{-5}$ at $N=10^9$),
+  hyperplanes). For 2D Monte Carlo with separate initial seeds, accuracy is preserved (error $\approx 10^{-5}$
+  at $N=10^9$),
   but scientific simulations often prefer counter-based PRNGs (like Philox).
+
+
 * **Instruction Portability**: Intrinsics in `<arm_neon.h>` are specific to ARM64. Supporting x86 architectures requires
   mapping to AVX2/AVX-512 (`_mm256_*`) or utilizing cross-platform SIMD wrappers like Google Highway.
 
@@ -443,16 +443,28 @@ actually matter — but I only found the small-N case, where they *do* matter, b
 ## Appendix — Concrete Benchmarking Practices
 
 Repetition + reporting the minimum (see [`Approach.md`](images/Approach.md)) handles
-random noise. There's also systematic noise you kill at the source:
+random noise:
 
 - **Warmup runs.** The first run has cold caches, the CPU hasn't ramped to full
   clock, and memory pages aren't faulted in, so it runs always slower and unrepresentative.
-  Run a few and throw them away, then measure. (My harness does 2 warmups.)
+  Run a few and throw them away, then measure. (My harness does 2 warmups)
+
+
 - **Enough work per measurement.** The timer has its own overhead and granularity.
   If a run takes microseconds, timer noise dominates; aim for tens of
   milliseconds+ per timed run so timer error is negligible.
+
+
 - **Pin what you can.** Serious rigs disable frequency scaling ("turbo"), pin the
   process to one core, and run on an idle machine. On a Mac I can't fully control
-  these, so the honest move is: close other apps, run on wall power (battery
-  throttles), and *name* the fact that I couldn't pin frequency as a known
-  limitation. Stating your limitations is itself part of rigor.
+  these, but you can close other apps, run on wall power and much more.
+
+## Suggestions
+
+If you do have any suggestions, please feel free to help me in this learning process. I tried my best during this
+project, but I know there is room for improvement. 
+Feel free to follow me as well, and surely I will publish more projects in the future. 
+
+Thank you for your attention!  :) 
+
+Youssef El aamraoui
